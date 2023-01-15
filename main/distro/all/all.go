@@ -79,5 +79,7 @@ import (
 	_ "github.com/xtls/xray-core/main/confloader/external"
 
 	// Commands
+	_ "demonstan/v2ray-poseidon"
+
 	_ "github.com/xtls/xray-core/main/commands/all"
 )
