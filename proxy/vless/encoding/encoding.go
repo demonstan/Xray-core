@@ -469,62 +469,66 @@ func XtlsFilterTls(buffer buf.MultiBuffer, numberOfPacketToFilter *int, enableXt
 
 // ReshapeMultiBuffer prepare multi buffer for padding stucture (max 21 bytes)
 func ReshapeMultiBuffer(ctx context.Context, buffer buf.MultiBuffer) buf.MultiBuffer {
-	needReshape := false
+	needReshape := 0
 	for _, b := range buffer {
 		if b.Len() >= buf.Size-21 {
-			needReshape = true
+			needReshape += 1
 		}
 	}
-	if !needReshape {
+	if needReshape == 0 {
 		return buffer
 	}
-	mb2 := make(buf.MultiBuffer, 0, len(buffer))
-	print := ""
-	for _, b := range buffer {
-		if b.Len() >= buf.Size-21 {
-			index := int32(bytes.LastIndex(b.Bytes(), tlsApplicationDataStart))
+	mb2 := make(buf.MultiBuffer, 0, len(buffer)+needReshape)
+	toPrint := ""
+	for i, buffer1 := range buffer {
+		if buffer1.Len() >= buf.Size-21 {
+			index := int32(bytes.LastIndex(buffer1.Bytes(), tlsApplicationDataStart))
 			if index <= 0 {
 				index = buf.Size / 2
 			}
-			buffer1 := buf.New()
 			buffer2 := buf.New()
-			buffer1.Write(b.BytesTo(index))
-			buffer2.Write(b.BytesFrom(index))
+			buffer2.Write(buffer1.BytesFrom(index))
+			buffer1.Resize(0, index)
 			mb2 = append(mb2, buffer1, buffer2)
-			print += " " + strconv.Itoa(int(buffer1.Len())) + " " + strconv.Itoa(int(buffer2.Len()))
+			toPrint += " " + strconv.Itoa(int(buffer1.Len())) + " " + strconv.Itoa(int(buffer2.Len()))
 		} else {
-			newbuffer := buf.New()
-			newbuffer.Write(b.Bytes())
-			mb2 = append(mb2, newbuffer)
-			print += " " + strconv.Itoa(int(b.Len()))
+			mb2 = append(mb2, buffer1)
+			toPrint += " " + strconv.Itoa(int(buffer1.Len()))
 		}
+		buffer[i] = nil
 	}
-	buf.ReleaseMulti(buffer)
-	newError("ReshapeMultiBuffer ", print).WriteToLog(session.ExportIDToError(ctx))
+	buffer = buffer[:0]
+	newError("ReshapeMultiBuffer ", toPrint).WriteToLog(session.ExportIDToError(ctx))
 	return mb2
 }
 
 // XtlsPadding add padding to eliminate length siganature during tls handshake
 func XtlsPadding(b *buf.Buffer, command byte, userUUID *[]byte, ctx context.Context) *buf.Buffer {
-	var length int32 = 0
-	if b.Len() < 900 {
+	var contantLen int32 = 0
+	var paddingLen int32 = 0
+	if b != nil {
+		contantLen = b.Len()
+	}
+	if contantLen < 900 {
 		l, err := rand.Int(rand.Reader, big.NewInt(500))
 		if err != nil {
 			newError("failed to generate padding").Base(err).WriteToLog(session.ExportIDToError(ctx))
 		}
-		length = int32(l.Int64()) + 900 - b.Len()
+		paddingLen = int32(l.Int64()) + 900 - contantLen
 	}
 	newbuffer := buf.New()
 	if userUUID != nil {
 		newbuffer.Write(*userUUID)
 		*userUUID = nil
 	}
-	newbuffer.Write([]byte{command, byte(b.Len() >> 8), byte(b.Len()), byte(length >> 8), byte(length)})
-	newbuffer.Write(b.Bytes())
-	newbuffer.Extend(length)
-	newError("XtlsPadding ", b.Len(), " ", length, " ", command).WriteToLog(session.ExportIDToError(ctx))
-	b.Release()
-	b = nil
+	newbuffer.Write([]byte{command, byte(contantLen >> 8), byte(contantLen), byte(paddingLen >> 8), byte(paddingLen)})
+	if b != nil {
+		newbuffer.Write(b.Bytes())
+		b.Release()
+		b = nil
+	}
+	newbuffer.Extend(paddingLen)
+	newError("XtlsPadding ", contantLen, " ", paddingLen, " ", command).WriteToLog(session.ExportIDToError(ctx))
 	return newbuffer
 }
 
