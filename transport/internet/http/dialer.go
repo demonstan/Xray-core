@@ -3,6 +3,7 @@ package http
 import (
 	"context"
 	gotls "crypto/tls"
+	"io"
 	"net/http"
 	"net/url"
 	"sync"
@@ -52,7 +53,7 @@ func getHTTPClient(ctx context.Context, dest net.Destination, streamSettings *in
 	}
 
 	transport := &http2.Transport{
-		DialTLS: func(network string, addr string, tlsConfig *gotls.Config) (net.Conn, error) {
+		DialTLSContext: func(hctx context.Context, string, addr string, tlsConfig *gotls.Config) (net.Conn, error) {
 			rawHost, rawPort, err := net.SplitHostPort(addr)
 			if err != nil {
 				return nil, err
@@ -66,18 +67,18 @@ func getHTTPClient(ctx context.Context, dest net.Destination, streamSettings *in
 			}
 			address := net.ParseAddress(rawHost)
 
-			dctx := context.Background()
-			dctx = session.ContextWithID(dctx, session.IDFromContext(ctx))
-			dctx = session.ContextWithOutbound(dctx, session.OutboundFromContext(ctx))
+			hctx = session.ContextWithID(hctx, session.IDFromContext(ctx))
+			hctx = session.ContextWithOutbound(hctx, session.OutboundFromContext(ctx))
+			hctx = session.ContextWithTimeoutOnly(hctx, true)
 
-			pconn, err := internet.DialSystem(dctx, net.TCPDestination(address, port), sockopt)
+			pconn, err := internet.DialSystem(hctx, net.TCPDestination(address, port), sockopt)
 			if err != nil {
 				newError("failed to dial to " + addr).Base(err).AtError().WriteToLog()
 				return nil, err
 			}
 
 			if realityConfigs != nil {
-				return reality.UClient(pconn, realityConfigs, ctx, dest)
+				return reality.UClient(pconn, realityConfigs, hctx, dest)
 			}
 
 			var cn tls.Interface
@@ -166,23 +167,77 @@ func Dial(ctx context.Context, dest net.Destination, streamSettings *internet.Me
 	// Disable any compression method from server.
 	request.Header.Set("Accept-Encoding", "identity")
 
-	response, err := client.Do(request)
-	if err != nil {
-		return nil, newError("failed to dial to ", dest).Base(err).AtWarning()
-	}
-	if response.StatusCode != 200 {
-		return nil, newError("unexpected status", response.StatusCode).AtWarning()
-	}
+	wrc := &WaitReadCloser{Wait: make(chan struct{})}
+	go func() {
+		response, err := client.Do(request)
+		if err != nil {
+			newError("failed to dial to ", dest).Base(err).AtWarning().WriteToLog(session.ExportIDToError(ctx))
+			wrc.Close()
+			{
+				// Abandon `client` if `client.Do(request)` failed
+				// See https://github.com/golang/go/issues/30702
+				globalDialerAccess.Lock()
+				if globalDialerMap[dialerConf{dest, streamSettings}] == client {
+					delete(globalDialerMap, dialerConf{dest, streamSettings})
+				}
+				globalDialerAccess.Unlock()
+			}
+			return
+		}
+		if response.StatusCode != 200 {
+			newError("unexpected status", response.StatusCode).AtWarning().WriteToLog(session.ExportIDToError(ctx))
+			wrc.Close()
+			return
+		}
+		wrc.Set(response.Body)
+	}()
 
 	bwriter := buf.NewBufferedWriter(pwriter)
 	common.Must(bwriter.SetBuffered(false))
 	return cnc.NewConnection(
-		cnc.ConnectionOutput(response.Body),
+		cnc.ConnectionOutput(wrc),
 		cnc.ConnectionInput(bwriter),
-		cnc.ConnectionOnClose(common.ChainedClosable{breader, bwriter, response.Body}),
+		cnc.ConnectionOnClose(common.ChainedClosable{breader, bwriter, wrc}),
 	), nil
 }
 
 func init() {
 	common.Must(internet.RegisterTransportDialer(protocolName, Dial))
+}
+
+type WaitReadCloser struct {
+	Wait chan struct{}
+	io.ReadCloser
+}
+
+func (w *WaitReadCloser) Set(rc io.ReadCloser) {
+	w.ReadCloser = rc
+	defer func() {
+		if recover() != nil {
+			rc.Close()
+		}
+	}()
+	close(w.Wait)
+}
+
+func (w *WaitReadCloser) Read(b []byte) (int, error) {
+	if w.ReadCloser == nil {
+		if <-w.Wait; w.ReadCloser == nil {
+			return 0, io.ErrClosedPipe
+		}
+	}
+	return w.ReadCloser.Read(b)
+}
+
+func (w *WaitReadCloser) Close() error {
+	if w.ReadCloser != nil {
+		return w.ReadCloser.Close()
+	}
+	defer func() {
+		if recover() != nil && w.ReadCloser != nil {
+			w.ReadCloser.Close()
+		}
+	}()
+	close(w.Wait)
+	return nil
 }
